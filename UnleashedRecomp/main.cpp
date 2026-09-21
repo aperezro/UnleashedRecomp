@@ -206,16 +206,18 @@ int main(int argc, char *argv[])
 
     os::process::CheckConsole();
 
+#ifdef UNLEASHED_RECOMP_IOS
+    // MoltenVK must convert Vulkan clip coordinates to Metal, including shaders
+    // compiled with DXC's -fvk-invert-y.
+    setenv("MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y", "1", 1);
+#endif
+
     InitPaths();
 
     if (!os::registry::Init())
         LOGN_WARNING("OS does not support registry.");
 
     os::logger::Init();
-
-#ifdef UNLEASHED_RECOMP_IOS
-    LOGN("iOS startup build: threaded-guest-v5");
-#endif
 
     PreloadContext preloadContext;
     preloadContext.PreloadExecutable();
@@ -351,6 +353,16 @@ int main(int argc, char *argv[])
         PathToUTF8(modulePath));
 
     bool runInstallerWizard = forceInstaller || forceDLCInstaller || !isGameInstalled;
+
+#ifdef UNLEASHED_RECOMP_IOS
+    auto modulePathU8 = modulePath.u8string();
+    fprintf(stderr, "[iOS startup] installed=%d installer=%d module=%s\n",
+        isGameInstalled ? 1 : 0,
+        runInstallerWizard ? 1 : 0,
+        reinterpret_cast<const char*>(modulePathU8.c_str()));
+    fflush(stderr);
+#endif
+
     if (runInstallerWizard)
     {
         if (!Video::CreateHostDevice(sdlVideoDriver, graphicsApiRetry))
@@ -367,6 +379,13 @@ int main(int argc, char *argv[])
 
         isGameInstalled = Installer::checkGameInstall(gamePath, modulePath);
         LOGFN("Install status after wizard: installed={}, modulePath={}", isGameInstalled, PathToUTF8(modulePath));
+#ifdef UNLEASHED_RECOMP_IOS
+        modulePathU8 = modulePath.u8string();
+        fprintf(stderr, "[iOS startup] post-installer installed=%d module=%s\n",
+            isGameInstalled ? 1 : 0,
+            reinterpret_cast<const char*>(modulePathU8.c_str()));
+        fflush(stderr);
+#endif
         if (!isGameInstalled)
         {
             const std::string errorMessage = "The game data installation did not finish correctly. Please run the installer again and select the base game ISO plus update file.";
@@ -394,6 +413,11 @@ int main(int argc, char *argv[])
     }
     LOGFN("Loaded module entry: 0x{:08X}", entry);
 
+#ifdef UNLEASHED_RECOMP_IOS
+    fprintf(stderr, "[iOS startup] loaded module entry=0x%08X\n", entry);
+    fflush(stderr);
+#endif
+
     if (!runInstallerWizard)
     {
         if (!Video::CreateHostDevice(sdlVideoDriver, graphicsApiRetry))
@@ -403,14 +427,17 @@ int main(int argc, char *argv[])
         }
     }
 
-    LOGN("Starting pipeline precompilation.");
+#ifndef UNLEASHED_RECOMP_IOS
     Video::StartPipelinePrecompilation();
+#endif
 
 #ifdef UNLEASHED_RECOMP_IOS
-    LOGFN("Starting guest worker thread at 0x{:08X}", entry);
+    fprintf(stderr, "[iOS startup] starting guest entry=0x%08X\n", entry);
+    fflush(stderr);
     GuestThread::Start({ entry, 0, 0 }, nullptr);
 
-    LOGN("Entering iOS SDL event pump.");
+    fprintf(stderr, "[iOS startup] entering SDL event pump\n");
+    fflush(stderr);
     while (true)
     {
         SDL_PumpEvents();
@@ -419,7 +446,6 @@ int main(int argc, char *argv[])
         SDL_Delay(1);
     }
 #else
-    LOGFN("Starting guest thread at 0x{:08X}", entry);
     GuestThread::Start({ entry, 0, 0 });
 #endif
 

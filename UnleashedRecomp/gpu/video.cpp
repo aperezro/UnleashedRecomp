@@ -33,7 +33,6 @@
 #include <user/config.h>
 #include <sdl_listener.h>
 #include <xxHashMap.h>
-#include <os/logger.h>
 #include <os/process.h>
 
 #if defined(ASYNC_PSO_DEBUG) || defined(PSO_CACHING)
@@ -101,30 +100,20 @@ extern "C"
 }
 #endif
 
-#if defined(UNLEASHED_RECOMP_IOS) && defined(__APPLE__) && !defined(SDL_VULKAN_ENABLED)
-#define UNLEASHED_RECOMP_USE_METAL 1
-#endif
-
 namespace plume
 {
+#ifdef UNLEASHED_RECOMP_METAL
+    extern std::unique_ptr<RenderInterface> CreateMetalInterface();
+#endif
 #ifdef UNLEASHED_RECOMP_D3D12
     extern std::unique_ptr<RenderInterface> CreateD3D12Interface();
 #endif
-#ifdef UNLEASHED_RECOMP_USE_METAL
-    extern std::unique_ptr<RenderInterface> CreateMetalInterface();
-#else
 #ifdef SDL_VULKAN_ENABLED
     extern std::unique_ptr<RenderInterface> CreateVulkanInterface(RenderWindow sdlWindow);
 #else
     extern std::unique_ptr<RenderInterface> CreateVulkanInterface();
 #endif
-#endif
 
-#ifdef UNLEASHED_RECOMP_USE_METAL
-    static std::unique_ptr<RenderInterface> CreateMetalInterfaceWrapper() {
-        return CreateMetalInterface();
-    }
-#else
     static std::unique_ptr<RenderInterface> CreateVulkanInterfaceWrapper() {
 #ifdef SDL_VULKAN_ENABLED
         return CreateVulkanInterface(GameWindow::s_renderWindow);
@@ -132,7 +121,6 @@ namespace plume
         return CreateVulkanInterface();
 #endif
     }
-#endif
 }
 
 #pragma pack(push, 1)
@@ -306,15 +294,6 @@ static bool g_vulkan = false;
 static constexpr bool g_vulkan = true;
 #endif
 
-static const char* GetGraphicsApiName()
-{
-#ifdef UNLEASHED_RECOMP_USE_METAL
-    return "Metal";
-#else
-    return g_vulkan ? "Vulkan" : "D3D12";
-#endif
-}
-
 static bool g_triangleStripWorkaround = false;
 
 static bool g_hardwareResolve = true;
@@ -344,6 +323,12 @@ static std::unique_ptr<RenderCommandFence> g_copyCommandFence;
 
 static std::unique_ptr<RenderSwapChain> g_swapChain;
 static bool g_swapChainValid;
+
+#ifdef UNLEASHED_RECOMP_IOS
+#define IOS_VIDEO_LOG(...) do { fprintf(stderr, "[iOS video] " __VA_ARGS__); fflush(stderr); } while (false)
+#else
+#define IOS_VIDEO_LOG(...) do { } while (false)
+#endif
 
 static constexpr RenderFormat BACKBUFFER_FORMAT = RenderFormat::B8G8R8A8_UNORM;
 
@@ -1556,13 +1541,18 @@ static void CreateImGuiBackend()
 static void CheckSwapChain()
 {
     g_swapChain->setVsyncEnabled(Config::VSync);
-    g_swapChainValid &= !g_swapChain->needsResize();
+    const bool neededResize = g_swapChain->needsResize();
+    bool resized = false;
+    bool acquired = false;
+
+    g_swapChainValid &= !neededResize;
 
     if (!g_swapChainValid)
     {
         Video::WaitForGPU();
         g_backBuffer->framebuffers.clear();
         g_swapChainValid = g_swapChain->resize();
+        resized = g_swapChainValid;
         g_needsResize = g_swapChainValid;
     }
 
@@ -1570,6 +1560,7 @@ static void CheckSwapChain()
     {
         g_swapChainAcquireProfiler.Begin();
         g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[g_frame].get(), &g_backBufferIndex);
+        acquired = g_swapChainValid;
         g_swapChainAcquireProfiler.End();
     }
 
@@ -1578,6 +1569,25 @@ static void CheckSwapChain()
 
     g_backBuffer->width = Video::s_viewportWidth;
     g_backBuffer->height = Video::s_viewportHeight;
+
+#ifdef UNLEASHED_RECOMP_IOS
+    static uint32_t s_checkLogCount = 0;
+    if (s_checkLogCount < 20 || !g_swapChainValid)
+    {
+        IOS_VIDEO_LOG("check #%u neededResize=%d resized=%d acquired=%d valid=%d backBuffer=%u viewport=%ux%u swapchain=%ux%u\n",
+            s_checkLogCount,
+            neededResize ? 1 : 0,
+            resized ? 1 : 0,
+            acquired ? 1 : 0,
+            g_swapChainValid ? 1 : 0,
+            g_backBufferIndex,
+            Video::s_viewportWidth,
+            Video::s_viewportHeight,
+            g_swapChain->getWidth(),
+            g_swapChain->getHeight());
+    }
+    s_checkLogCount++;
+#endif
 }
 
 static void BeginCommandList()
@@ -1779,10 +1789,12 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
     interfaceFunctions.push_back(g_vulkan ? CreateVulkanInterfaceWrapper : CreateD3D12Interface);
     interfaceFunctions.push_back(g_vulkan ? CreateD3D12Interface : CreateVulkanInterfaceWrapper);
-#elif defined(UNLEASHED_RECOMP_USE_METAL)
-    interfaceFunctions.push_back(CreateMetalInterfaceWrapper);
+#else
+#ifdef UNLEASHED_RECOMP_METAL
+    interfaceFunctions.push_back(CreateMetalInterface);
 #else
     interfaceFunctions.push_back(CreateVulkanInterfaceWrapper);
+#endif
 #endif
 
     for (size_t i = 0; i < interfaceFunctions.size(); i++)
@@ -1892,6 +1904,9 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 #endif
 
     g_capabilities = g_device->getCapabilities();
+#ifdef UNLEASHED_RECOMP_METAL
+    IOS_VIDEO_LOG("backend=Native Metal device=%s\n", g_device->getDescription().name.c_str());
+#endif
 
     LoadEmbeddedResources();
 
@@ -1969,19 +1984,6 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     g_swapChain = g_queue->createSwapChain(GameWindow::s_renderWindow, bufferCount, BACKBUFFER_FORMAT, Config::MaxFrameLatency);
     g_swapChain->setVsyncEnabled(Config::VSync);
     g_swapChainValid = !g_swapChain->needsResize();
-
-#ifdef UNLEASHED_RECOMP_IOS
-    LOGFN("Created iOS swapchain: buffers={} maxFrameLatency={} valid={} size={}x{} viewport={}x{} window={}x{}",
-        bufferCount,
-        Config::MaxFrameLatency.Value,
-        g_swapChainValid,
-        g_swapChain->getWidth(),
-        g_swapChain->getHeight(),
-        Video::s_viewportWidth,
-        Video::s_viewportHeight,
-        GameWindow::s_width,
-        GameWindow::s_height);
-#endif
 
     for (auto& acquireSemaphore : g_acquireSemaphores)
         acquireSemaphore = g_device->createCommandSemaphore();
@@ -2198,10 +2200,6 @@ void Video::WaitForGPU()
 
 static uint32_t CreateDevice(uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, be<uint32_t>* a6)
 {
-#ifdef UNLEASHED_RECOMP_IOS
-    LOGFN("Guest CreateDevice called: a1=0x{:08X} a2=0x{:08X} a3=0x{:08X} a4=0x{:08X} a5=0x{:08X}", a1, a2, a3, a4, a5);
-#endif
-
     g_xdbfTextureCache = std::unordered_map<uint16_t, GuestTexture *>();
 
     for (auto &achievement : g_xdbfWrapper.GetAchievements(XDBF_LANGUAGE_ENGLISH))
@@ -2250,10 +2248,6 @@ static uint32_t CreateDevice(uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
     device->viewport.maxZ = 1.0f;
 
     *a6 = g_memory.MapVirtual(device);
-
-#ifdef UNLEASHED_RECOMP_IOS
-    LOGFN("Guest CreateDevice finished: device=0x{:08X}", uint32_t(*a6));
-#endif
 
     return 0;
 }
@@ -2576,7 +2570,7 @@ static void DrawProfiler()
         ImGui::Text("Hardware Depth Resolve: %s", g_hardwareDepthResolve ? "Enabled" : "Disabled");
         ImGui::NewLine();
 
-        ImGui::Text("API: %s", GetGraphicsApiName());
+        ImGui::Text("API: %s", g_vulkan ? "Vulkan" : "D3D12");
         ImGui::Text("Device: %s", g_device->getDescription().name.c_str());
         ImGui::Text("Device Type: %s", DeviceTypeName(g_device->getDescription().type));
         ImGui::Text("VRAM: %.2f MiB", (double)(g_device->getDescription().dedicatedVideoMemory) / (1024.0 * 1024.0));
@@ -2650,6 +2644,9 @@ static void DrawFPS()
 
 static void DrawImGui()
 {
+#ifdef UNLEASHED_RECOMP_IOS
+    GameWindow::ProcessImGuiEvents();
+#endif
     ImGui_ImplSDL2_NewFrame();
 
     auto& io = ImGui::GetIO();
@@ -2701,9 +2698,9 @@ static void DrawImGui()
     InstallerWizard::Draw();
     MessageWindow::Draw();
     ButtonGuide::Draw();
-    TouchControls::Draw();
     Fader::Draw();
     BlackBar::Draw();
+    TouchControls::Draw();
 
     assert(ImGui::GetBackgroundDrawList()->_ClipRectStack.Size == 1 && "Some clip rects were not removed from the stack!");
 
@@ -2896,12 +2893,10 @@ static std::atomic<bool> g_executedCommandList;
 void Video::Present() 
 {
 #ifdef UNLEASHED_RECOMP_IOS
-    static uint32_t s_presentCount = 0;
-    if (s_presentCount < 5 || (s_presentCount % 300) == 0)
-    {
-        LOGFN("Video::Present count={} swapChainValid={}", s_presentCount, g_swapChainValid);
-    }
-    s_presentCount++;
+    GameWindow::WaitUntilActive();
+    static uint32_t s_presentEntryCount = 0;
+    if (s_presentEntryCount++ < 5)
+        IOS_VIDEO_LOG("guest present entered\n");
 #endif
 
     g_readyForCommands = false;
@@ -2925,6 +2920,8 @@ void Video::Present()
     g_executedCommandList.wait(false);
     g_executedCommandList = false;
 
+    bool presented = false;
+
     if (g_swapChainValid)
     {
         if (g_pendingWaitOnSwapChain)
@@ -2936,7 +2933,23 @@ void Video::Present()
 
         RenderCommandSemaphore* signalSemaphores[] = { g_renderSemaphores[g_frame].get() };
         g_swapChainValid = g_swapChain->present(g_backBufferIndex, signalSemaphores, std::size(signalSemaphores));
+        presented = g_swapChainValid;
     }
+
+#ifdef UNLEASHED_RECOMP_IOS
+    static uint32_t s_presentLogCount = 0;
+    if (s_presentLogCount < 20 || !g_swapChainValid)
+    {
+        IOS_VIDEO_LOG("present #%u submitted=%d valid=%d backBuffer=%u frame=%u next=%u\n",
+            s_presentLogCount,
+            presented ? 1 : 0,
+            g_swapChainValid ? 1 : 0,
+            g_backBufferIndex,
+            g_frame,
+            g_nextFrame);
+    }
+    s_presentLogCount++;
+#endif
 
     g_pendingWaitOnSwapChain = true;
 
@@ -2991,6 +3004,31 @@ void Video::Present()
     }
 
     g_presentProfiler.Reset();
+#ifdef UNLEASHED_RECOMP_IOS
+    static const bool profileEnabled = std::getenv("UNLEASHED_IOS_PROFILE") != nullptr;
+    if (profileEnabled)
+    {
+        static auto reportStart = std::chrono::steady_clock::now();
+        static uint32_t frameCount = 0;
+        static double gpuTime = 0, updateTime = 0, renderTime = 0, fenceTime = 0;
+        ++frameCount;
+        gpuTime += g_gpuFrameProfiler.value.load();
+        updateTime += g_updateDirectorProfiler.value.load();
+        renderTime += g_renderDirectorProfiler.value.load();
+        fenceTime += g_frameFenceProfiler.value.load();
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - reportStart).count();
+        if (seconds >= 5.0)
+        {
+            IOS_VIDEO_LOG("profile fps=%.1f gpu=%.2fms update=%.2fms render=%.2fms fence=%.2fms scale=%.3f\n",
+                frameCount / seconds, gpuTime / frameCount, updateTime / frameCount,
+                renderTime / frameCount, fenceTime / frameCount, GetEffectiveResolutionScale());
+            reportStart = now;
+            frameCount = 0;
+            gpuTime = updateTime = renderTime = fenceTime = 0;
+        }
+    }
+#endif
 }
 
 void Video::StartPipelinePrecompilation()
@@ -3002,10 +3040,14 @@ static void SetRootDescriptor(const UploadAllocation& allocation, size_t index)
 {
     auto& commandList = g_commandLists[g_frame];
 
+#if defined(UNLEASHED_RECOMP_METAL)
+    commandList->setGraphicsRootDescriptor(allocation.buffer->at(allocation.offset), index);
+#else
     if (g_vulkan)
         commandList->setGraphicsPushConstants(0, &allocation.deviceAddress, 8 * index, 8);
     else
         commandList->setGraphicsRootDescriptor(allocation.buffer->at(allocation.offset), index);
+#endif
 }
 
 static void ProcExecuteCommandList(const RenderCommand& cmd)
@@ -7059,16 +7101,20 @@ static std::thread::id g_mainThreadId = std::this_thread::get_id();
 PPC_FUNC_IMPL(__imp__sub_825369A0);
 PPC_FUNC(sub_825369A0)
 {
+#ifndef UNLEASHED_RECOMP_IOS
     assert(std::this_thread::get_id() == g_mainThreadId);
+#endif
 
     // Wait for pipeline compilations to finish.
     uint32_t value;
     while ((value = g_compilingPipelineTaskCount.load()) != 0)
     {
+#ifndef UNLEASHED_RECOMP_IOS
         // Pump SDL events to prevent the OS
         // from thinking the process is unresponsive.
         SDL_PumpEvents();
         SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+#endif
 
         g_compilingPipelineTaskCount.wait(value);
     }

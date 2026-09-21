@@ -31,9 +31,6 @@ static const std::string UpdateExecutablePatchFile = "default.xexp";
 static const std::string ISOExtension = ".iso";
 static const std::string OldExtension = ".old";
 static const std::string TempExtension = ".tmp";
-#ifdef UNLEASHED_RECOMP_IOS
-static const std::string InstallValidationFile = "install.validated";
-#endif
 
 static std::string fromU8(const std::u8string &str)
 {
@@ -354,20 +351,6 @@ bool Installer::checkGameInstall(const std::filesystem::path &baseDirectory, std
     if (!std::filesystem::exists(baseDirectory / GameDirectory / GameExecutableFile))
         return false;
 
-#ifdef UNLEASHED_RECOMP_IOS
-    if (!std::filesystem::exists(baseDirectory / InstallValidationFile))
-        return false;
-
-    Journal journal;
-    if (!checkInstallCompleteness(baseDirectory, journal, []()
-    {
-        return true;
-    }))
-    {
-        return false;
-    }
-#endif
-
     return true;
 }
 
@@ -403,35 +386,6 @@ bool Installer::checkAllDLC(const std::filesystem::path& baseDirectory)
     }
 
     return result;
-}
-
-bool Installer::checkInstallCompleteness(const std::filesystem::path &baseDirectory, Journal &journal, const std::function<bool()> &progressCallback)
-{
-    if (!checkFiles({ GameFiles, GameFilesSize }, GameHashes, baseDirectory / GameDirectory, journal, progressCallback, true))
-    {
-        return false;
-    }
-
-    if (!checkFiles({ UpdateFiles, UpdateFilesSize }, UpdateHashes, baseDirectory / UpdateDirectory, journal, progressCallback, true))
-    {
-        return false;
-    }
-
-    for (int i = 1; i < (int)DLC::Count; i++)
-    {
-        if (checkDLCInstall(baseDirectory, (DLC)i))
-        {
-            Installer::DLCSource dlcSource;
-            fillDLCSource((DLC)i, dlcSource);
-
-            if (!checkFiles(dlcSource.filePairs, dlcSource.fileHashes, baseDirectory / dlcSource.targetSubDirectory, journal, progressCallback, true))
-            {
-                return false;
-            }
-        }
-    }
-
-    return true;
 }
 
 bool Installer::checkInstallIntegrity(const std::filesystem::path &baseDirectory, Journal &journal, const std::function<bool()> &progressCallback)
@@ -643,21 +597,6 @@ bool Installer::install(Sources &sources, const std::filesystem::path &targetDir
     // Install files in reverse order of importance. In case of a process crash or power outage, this will increase the likelihood of the installation
     // missing critical files required for the game to run. These files are used as the way to detect if the game is installed.
 
-#ifdef UNLEASHED_RECOMP_IOS
-    const bool isInstallingGameData = sources.game != nullptr || sources.update != nullptr;
-    if (isInstallingGameData)
-    {
-        std::error_code ec;
-        std::filesystem::remove(targetDirectory / InstallValidationFile, ec);
-        if (ec)
-        {
-            journal.lastResult = Journal::Result::FileWriteFailed;
-            journal.lastErrorMessage = fmt::format("Failed to remove validation file at {}.", fromPath(targetDirectory / InstallValidationFile));
-            return false;
-        }
-    }
-#endif
-
     // Install the DLC.
     if (!sources.dlc.empty())
     {
@@ -729,37 +668,6 @@ bool Installer::install(Sources &sources, const std::filesystem::path &targetDir
 
     // Update the progress with the artificial amount attributed to the patching.
     journal.progressCounter += PatcherContribution;
-
-#ifdef UNLEASHED_RECOMP_IOS
-    Journal validationJournal;
-    if (!checkInstallIntegrity(targetDirectory, validationJournal, progressCallback))
-    {
-        journal.lastResult = validationJournal.lastResult;
-        journal.lastPatcherResult = validationJournal.lastPatcherResult;
-        journal.lastErrorMessage = validationJournal.lastErrorMessage;
-        return false;
-    }
-
-    std::filesystem::path validationPath = targetDirectory / InstallValidationFile;
-    std::ofstream validationStream(validationPath, std::ios::binary);
-    if (!validationStream.is_open())
-    {
-        journal.lastResult = Journal::Result::FileCreationFailed;
-        journal.lastErrorMessage = fmt::format("Failed to create file at {}.", fromPath(validationPath));
-        return false;
-    }
-
-    validationStream << "ok\n";
-    validationStream.flush();
-    if (!validationStream.good())
-    {
-        journal.lastResult = Journal::Result::FileWriteFailed;
-        journal.lastErrorMessage = fmt::format("Failed to write file at {}.", fromPath(validationPath));
-        return false;
-    }
-
-    journal.createdFiles.push_back(validationPath);
-#endif
     
     for (uint32_t i = 0; i < 2; i++)
     {

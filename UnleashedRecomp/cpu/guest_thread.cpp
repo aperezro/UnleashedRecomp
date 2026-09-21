@@ -144,10 +144,31 @@ uint32_t GuestThread::Start(const GuestThreadParams& params)
     const auto procMask = (uint8_t)(params.flags >> 24);
     const auto cpuNumber = procMask == 0 ? 0 : 7 - std::countl_zero(procMask);
 
+#ifdef UNLEASHED_RECOMP_IOS
+    fprintf(stderr, "[iOS guest] start function=0x%08X value=0x%08X flags=0x%08X cpu=%u\n",
+        params.function,
+        params.value,
+        params.flags,
+        cpuNumber);
+    fflush(stderr);
+#endif
+
     GuestThreadContext ctx(cpuNumber);
     ctx.ppcContext.r3.u64 = params.value;
 
-    g_memory.FindFunction(params.function)(ctx.ppcContext, g_memory.base);
+    PPCFunc* function = g_memory.FindFunction(params.function);
+
+#ifdef UNLEASHED_RECOMP_IOS
+    fprintf(stderr, "[iOS guest] host function=%p\n", reinterpret_cast<void*>(function));
+    fflush(stderr);
+#endif
+
+    function(ctx.ppcContext, g_memory.base);
+
+#ifdef UNLEASHED_RECOMP_IOS
+    fprintf(stderr, "[iOS guest] returned r3=0x%08X\n", ctx.ppcContext.r3.u32);
+    fflush(stderr);
+#endif
 
     return ctx.ppcContext.r3.u32;
 }

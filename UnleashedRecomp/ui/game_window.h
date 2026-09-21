@@ -3,9 +3,7 @@
 #include <plume_render_interface_types.h>
 #include <user/config.h>
 #include <sdl_events.h>
-#ifdef __APPLE__
-#include <SDL_metal.h>
-#endif
+#include <atomic>
 
 #define DEFAULT_WIDTH 1280
 #define DEFAULT_HEIGHT 720
@@ -17,16 +15,13 @@ class GameWindow
 public:
     static inline SDL_Window* s_pWindow = nullptr;
     static inline plume::RenderWindow s_renderWindow;
-#ifdef __APPLE__
-    static inline SDL_MetalView s_metalView = nullptr;
-#endif
 
     static inline int s_x;
     static inline int s_y;
     static inline int s_width = DEFAULT_WIDTH;
     static inline int s_height = DEFAULT_HEIGHT;
 
-    static inline bool s_isFocused;
+    static inline std::atomic<bool> s_isFocused;
     static inline bool s_isIconNight;
     static inline bool s_isFullscreenCursorVisible;
     static inline bool s_isChangingDisplay;
@@ -55,4 +50,9 @@ public:
     static bool IsPositionValid();
     static void Init(const char* sdlVideoDriver = nullptr);
     static void Update();
+#ifdef UNLEASHED_RECOMP_IOS
+    static inline std::atomic<bool> s_isActive{ true };
+    static void WaitUntilActive();
+    static void ProcessImGuiEvents();
+#endif
 };

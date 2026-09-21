@@ -1,42 +1,66 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 6a7645a..5417620 100644
+index 6a7645a..4fcf8d8 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -98,6 +98,34 @@ if(APPLE)
+@@ -8,10 +8,16 @@ if(APPLE)
+ endif()
+ 
+ string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "Linux" IS_LINUX)
++string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "iOS" IS_IOS)
++if(IS_LINUX OR IS_IOS)
++    set(IS_SDL_VULKAN_PLATFORM ON)
++else()
++    set(IS_SDL_VULKAN_PLATFORM OFF)
++endif()
+ 
+ # Project options
+ include(CMakeDependentOption)
+-cmake_dependent_option(SDL_VULKAN_ENABLED "Enable SDL Vulkan integration" OFF IS_LINUX OFF)
++cmake_dependent_option(SDL_VULKAN_ENABLED "Enable SDL Vulkan integration" OFF IS_SDL_VULKAN_PLATFORM OFF)
+ cmake_dependent_option(D3D12_AGILITY_SDK_ENABLED "Enable D3D12 Agility SDK" OFF WIN32 OFF)
+ option(PLUME_BUILD_EXAMPLES "Build example applications" OFF)
+ 
+@@ -50,7 +56,7 @@ set(PLUME_SOURCES
+ )
+ 
+ # Platform-specific files
+-if(APPLE)
++if(APPLE AND (NOT IS_IOS OR UNLEASHED_RECOMP_IOS_NATIVE_METAL))
+     list(APPEND PLUME_SOURCES
+         plume_metal.cpp
+         plume_metal.h
+@@ -94,10 +100,16 @@ if(D3D12_AGILITY_SDK_ENABLED)
+ endif()
+ 
+ # Platform-specific includes
+-if(APPLE)
++if(APPLE AND (NOT IS_IOS OR UNLEASHED_RECOMP_IOS_NATIVE_METAL))
      target_include_directories(plume PRIVATE
          ${CMAKE_CURRENT_SOURCE_DIR}/contrib/metal-cpp
      )
-+
-+    if(TARGET spirv-cross-msl)
-+        target_link_libraries(plume PUBLIC spirv-cross-msl)
-+    endif()
-+
-+    find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
-+    find_library(METAL_LIBRARY Metal REQUIRED)
-+    find_library(QUARTZCORE_LIBRARY QuartzCore REQUIRED)
-+
-+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-+        find_library(UIKIT_LIBRARY UIKit REQUIRED)
-+        target_link_libraries(plume PUBLIC
-+            ${FOUNDATION_LIBRARY}
-+            ${METAL_LIBRARY}
-+            ${QUARTZCORE_LIBRARY}
-+            ${UIKIT_LIBRARY}
-+        )
++    target_link_libraries(plume PUBLIC spirv-cross-msl "-framework Foundation" "-framework Metal" "-framework QuartzCore")
++    if(IS_IOS)
++        target_link_libraries(plume PUBLIC "-framework UIKit")
 +    else()
-+        find_library(APPKIT_LIBRARY AppKit REQUIRED)
-+        find_library(IOKIT_LIBRARY IOKit REQUIRED)
-+        target_link_libraries(plume PUBLIC
-+            ${APPKIT_LIBRARY}
-+            ${FOUNDATION_LIBRARY}
-+            ${IOKIT_LIBRARY}
-+            ${METAL_LIBRARY}
-+            ${QUARTZCORE_LIBRARY}
-+        )
++        target_link_libraries(plume PUBLIC "-framework AppKit" "-framework IOKit")
 +    endif()
  endif()
  
  # Add examples if requested
+diff --git a/plume_apple.h b/plume_apple.h
+index 731d3c4..3739b4f 100644
+--- a/plume_apple.h
++++ b/plume_apple.h
+@@ -14,6 +14,9 @@
+ namespace plume {
+     RenderDeviceVendor getRenderDeviceVendor(uint64_t registryID);
+ 
++    // iOS Metal: stop submissions and schedule outstanding work before suspension.
++    void setMetalApplicationActive(bool active);
++
+     struct CocoaWindowAttributes {
+         int x, y;
+         int width, height;
 diff --git a/plume_apple.mm b/plume_apple.mm
 index 64e4dc9..1d14600 100644
 --- a/plume_apple.mm
@@ -242,23 +266,86 @@ index 64e4dc9..1d14600 100644
      }
  }
 diff --git a/plume_metal.cpp b/plume_metal.cpp
-index ebbbaa3..6c91662 100644
+index ebbbaa3..b34aefb 100644
 --- a/plume_metal.cpp
 +++ b/plume_metal.cpp
-@@ -14,8 +14,12 @@
+@@ -14,12 +14,75 @@
  #include <QuartzCore/QuartzCore.hpp>
  #include <CoreFoundation/CoreFoundation.h>
  
 +#include <spirv_msl.hpp>
 +
  #include <algorithm>
++#include <condition_variable>
  #include <mutex>
++#include <pthread.h>
 +#include <stdexcept>
 +#include <string>
  
  #include "plume_metal.h"
  
-@@ -38,6 +42,307 @@ namespace plume {
+ namespace plume {
++#if PLUME_IOS
++    static std::mutex submissionMutex;
++    static std::condition_variable submissionCondition;
++    static bool applicationActive = true;
++    static std::unordered_map<MTL::CommandQueue *, MTL::CommandBuffer *> pendingSubmissions;
++
++    static std::unique_lock<std::mutex> lockSubmissions() {
++        std::unique_lock lock(submissionMutex);
++        while (!applicationActive) {
++            if (pthread_main_np()) {
++                // The installer renders on the UIKit thread. Keep activation
++                // notifications deliverable while a submission is suspended.
++                lock.unlock();
++                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
++                lock.lock();
++            }
++            else {
++                submissionCondition.wait(lock);
++            }
++        }
++        return lock;
++    }
++
++    // Called under submissionMutex; keep only the tail of each ordered queue.
++    static void trackSubmission(MTL::CommandQueue *queue, MTL::CommandBuffer *buffer) {
++        auto &previous = pendingSubmissions[queue];
++        if (previous != nullptr) {
++            previous->release();
++        }
++        previous = buffer->retain();
++    }
++
++    void setMetalApplicationActive(bool active) {
++        {
++            std::lock_guard lock(submissionMutex);
++            if (applicationActive == active) {
++                return;
++            }
++            applicationActive = active;
++            if (!active) {
++                // iOS may suspend us as soon as its lifecycle callback returns.
++                // Draining scheduling here also prevents lost event signals from
++                // rejected background buffers poisoning all subsequent frames.
++                for (auto &[queue, buffer] : pendingSubmissions) {
++                    buffer->waitUntilScheduled();
++                    buffer->release();
++                }
++                pendingSubmissions.clear();
++            }
++            fprintf(stderr, "Metal lifecycle: %s\n", active ? "resumed" : "suspended (submissions scheduled)");
++        }
++        if (active) {
++            submissionCondition.notify_all();
++        }
++    }
++#endif
++
+     // MARK: - Constants
+ 
+     static constexpr size_t MAX_DRAWABLES = 3;
+@@ -38,6 +101,310 @@ namespace plume {
          return (n + alignment - 1) & ~(alignment - 1);
      }
  
@@ -348,6 +435,7 @@ index ebbbaa3..6c91662 100644
 +    struct MetalShaderSource {
 +        std::string source;
 +        std::string entryPointName;
++        bool writesDepth = false;
 +    };
 +
 +#if PLUME_IOS
@@ -464,7 +552,7 @@ index ebbbaa3..6c91662 100644
 +    }
 +#endif
 +
-+    MetalShaderSource compileSpirvToMetalSource(const MetalDevice* device, const void* data, const uint64_t size, const char* entryPointName) {
++    MetalShaderSource compileSpirvToMetalSource(const MetalDevice* device, const void* data, const uint64_t size, const char* entryPointName, bool enableDepth = true) {
 +        if ((size % sizeof(uint32_t)) != 0) {
 +            throw std::runtime_error("SPIR-V shader data is not 32-bit aligned.");
 +        }
@@ -509,6 +597,7 @@ index ebbbaa3..6c91662 100644
 +        options.enable_decoration_binding = true;
 +        options.force_active_argument_buffer_resources = true;
 +        options.texture_buffer_native = true;
++        options.enable_frag_depth_builtin = enableDepth;
 +
 +        compiler.set_msl_options(options);
 +
@@ -555,6 +644,7 @@ index ebbbaa3..6c91662 100644
 +        MetalShaderSource translatedSource = {};
 +        translatedSource.entryPointName = compiler.get_cleansed_entry_point_name(spirvEntryPointName, executionModel);
 +        translatedSource.source = compiler.compile();
++        translatedSource.writesDepth = compiler.has_active_builtin(spv::BuiltInFragDepth, spv::StorageClassOutput);
 +#if PLUME_IOS
 +        translatedSource.entryPointName = findMetalEntryPointName(translatedSource.source, translatedSource.entryPointName);
 +        patchImplicitBaseBuiltinArguments(translatedSource.source, translatedSource.entryPointName);
@@ -566,7 +656,16 @@ index ebbbaa3..6c91662 100644
      uint64_t createClearPipelineKey(MTL::RenderPipelineDescriptor *pipelineDesc, bool depthWriteEnabled, bool stencilWriteEnabled) {
          auto colorFormat = [&](uint32_t index) {
              if (auto colorAttachment = pipelineDesc->colorAttachments()->object(index)) {
-@@ -1133,7 +1438,7 @@ namespace plume {
+@@ -1056,7 +1423,7 @@ namespace plume {
+             MTL::ArgumentDescriptor *argumentDesc = MTL::ArgumentDescriptor::alloc()->init();
+             argumentDesc->setDataType(mapDataType(lastRange.type));
+             argumentDesc->setIndex(lastRange.binding);
+-            argumentDesc->setArrayLength(device->capabilities.maxTextureSize);
++            argumentDesc->setArrayLength(desc.boundlessRangeSize);
+ 
+             if (lastRange.type == RenderDescriptorRangeType::TEXTURE) {
+                 argumentDesc->setTextureType(MTL::TextureType2D);
+@@ -1133,13 +1500,14 @@ namespace plume {
      }
  
      uint64_t MetalBuffer::getDeviceAddress() const {
@@ -575,14 +674,34 @@ index ebbbaa3..6c91662 100644
          return mtl->gpuAddress();
      }
  
-@@ -1278,24 +1583,46 @@ namespace plume {
+     // MetalBufferFormattedView
+ 
+     MetalBufferFormattedView::MetalBufferFormattedView(MetalBuffer *buffer, RenderFormat format) {
++        const auto releasePool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+         assert(buffer != nullptr);
+         assert((buffer->desc.flags & RenderBufferFlag::FORMATTED) && "Buffer must allow formatted views.");
+ 
+@@ -1159,7 +1527,6 @@ namespace plume {
+         MTL::TextureDescriptor *descriptor = MTL::TextureDescriptor::textureBufferDescriptor(pixelFormat, width, options, usage);
+         this->texture = buffer->mtl->newTexture(descriptor, 0, bytesPerRow);
+ 
+-        descriptor->release();
+     }
+ 
+     MetalBufferFormattedView::~MetalBufferFormattedView() {
+@@ -1275,27 +1642,57 @@ namespace plume {
+     // MetalShader
+ 
+     MetalShader::MetalShader(const MetalDevice *device, const void *data, uint64_t size, const char *entryPointName, const RenderShaderFormat format) {
++        const auto releasePool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
          assert(device != nullptr);
          assert(data != nullptr);
          assert(size > 0);
 -        assert(format == RenderShaderFormat::METAL);
  
          this->format = format;
-         this->functionName = (entryPointName != nullptr) ? NS::String::string(entryPointName, NS::UTF8StringEncoding) : MTLSTR("");
+-        this->functionName = (entryPointName != nullptr) ? NS::String::string(entryPointName, NS::UTF8StringEncoding) : MTLSTR("");
++        this->functionName = NS::String::alloc()->init(entryPointName != nullptr ? entryPointName : "", NS::UTF8StringEncoding);
  
          NS::Error *error = nullptr;
 -        const dispatch_data_t dispatchData = dispatch_data_create(data, size, dispatch_get_main_queue(), ^{});
@@ -594,11 +713,15 @@ index ebbbaa3..6c91662 100644
 +            try {
 +                const MetalShaderSource metalSource = compileSpirvToMetalSource(device, data, size, entryPointName);
 +                functionName->release();
-+                functionName = NS::String::string(metalSource.entryPointName.c_str(), NS::UTF8StringEncoding);
++                functionName = NS::String::alloc()->init(metalSource.entryPointName.c_str(), NS::UTF8StringEncoding);
 +                MTL::CompileOptions *compileOptions = MTL::CompileOptions::alloc()->init();
 +                compileOptions->setFastMathEnabled(true);
 +                compileOptions->setLanguageVersion(MTL::LanguageVersion3_0);
 +                library = device->mtl->newLibrary(NS::String::string(metalSource.source.c_str(), NS::UTF8StringEncoding), compileOptions, &error);
++                if (library != nullptr && metalSource.writesDepth) {
++                    const auto noDepthSource = compileSpirvToMetalSource(device, data, size, entryPointName, false);
++                    libraryWithoutDepth = device->mtl->newLibrary(NS::String::string(noDepthSource.source.c_str(), NS::UTF8StringEncoding), compileOptions, &error);
++                }
 +                compileOptions->release();
 +            } catch (const std::exception& e) {
 +                fprintf(stderr, "SPIR-V to MSL translation failed: %s.\n", e.what());
@@ -625,20 +748,27 @@ index ebbbaa3..6c91662 100644
 +        if (library) {
 +            library->release();
 +        }
++        if (libraryWithoutDepth) {
++            libraryWithoutDepth->release();
++        }
          if (debugName) {
              debugName->release();
          }
-@@ -1306,10 +1633,16 @@ namespace plume {
+@@ -1305,11 +1702,18 @@ namespace plume {
+         if (debugName) {
              debugName->release();
          }
-         debugName = NS::String::string(name.c_str(), NS::UTF8StringEncoding);
+-        debugName = NS::String::string(name.c_str(), NS::UTF8StringEncoding);
 -        library->setLabel(debugName);
++        debugName = NS::String::alloc()->init(name.c_str(), NS::UTF8StringEncoding);
 +        if (library) {
 +            library->setLabel(debugName);
 +        }
      }
  
-     MTL::Function* MetalShader::createFunction(const RenderSpecConstant *specConstants, const uint32_t specConstantsCount) const {
+-    MTL::Function* MetalShader::createFunction(const RenderSpecConstant *specConstants, const uint32_t specConstantsCount) const {
++    MTL::Function* MetalShader::createFunction(const RenderSpecConstant *specConstants, const uint32_t specConstantsCount, bool hasDepthAttachment) const {
++        const auto releasePool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 +        if (library == nullptr) {
 +            return nullptr;
 +        }
@@ -646,7 +776,16 @@ index ebbbaa3..6c91662 100644
          MTL::FunctionConstantValues *values = MTL::FunctionConstantValues::alloc()->init();
          if (specConstants != nullptr) {
              for (uint32_t i = 0; i < specConstantsCount; i++) {
-@@ -1325,6 +1658,10 @@ namespace plume {
+@@ -1318,13 +1722,18 @@ namespace plume {
+             }
+         }
+         NS::Error *error = nullptr;
+-        MTL::Function *function = library->newFunction(functionName, values, &error);
++        MTL::Library *selectedLibrary = !hasDepthAttachment && libraryWithoutDepth ? libraryWithoutDepth : library;
++        MTL::Function *function = selectedLibrary->newFunction(functionName, values, &error);
+         values->release();
+ 
+         if (error != nullptr) {
              fprintf(stderr, "MTLLibrary newFunction: failed with error: %s.\n", error->localizedDescription()->utf8String());
              return nullptr;
          }
@@ -657,7 +796,7 @@ index ebbbaa3..6c91662 100644
  
          if (debugName) {
              function->setLabel(debugName);
-@@ -1384,6 +1721,11 @@ namespace plume {
+@@ -1384,6 +1793,11 @@ namespace plume {
  
          MTL::ComputePipelineDescriptor *descriptor = MTL::ComputePipelineDescriptor::alloc()->init();
          MTL::Function *function = computeShader->createFunction(desc.specConstants, desc.specConstantsCount);
@@ -669,7 +808,7 @@ index ebbbaa3..6c91662 100644
          descriptor->setComputeFunction(function);
          descriptor->setLabel(computeShader->functionName);
  
-@@ -1437,6 +1779,13 @@ namespace plume {
+@@ -1437,6 +1851,13 @@ namespace plume {
          const MetalShader *metalShader = static_cast<const MetalShader *>(desc.vertexShader);
  
          MTL::Function *vertexFunction = metalShader->createFunction(desc.specConstants, desc.specConstantsCount);
@@ -683,10 +822,12 @@ index ebbbaa3..6c91662 100644
          descriptor->setVertexFunction(vertexFunction);
  
          MTL::VertexDescriptor *vertexDescriptor = MTL::VertexDescriptor::alloc()->init();
-@@ -1479,6 +1828,15 @@ namespace plume {
+@@ -1478,7 +1899,16 @@ namespace plume {
+ 
          if (desc.pixelShader != nullptr) {
              const MetalShader *pixelShader = static_cast<const MetalShader *>(desc.pixelShader);
-             MTL::Function *fragmentFunction = pixelShader->createFunction(desc.specConstants, desc.specConstantsCount);
+-            MTL::Function *fragmentFunction = pixelShader->createFunction(desc.specConstants, desc.specConstantsCount);
++            MTL::Function *fragmentFunction = pixelShader->createFunction(desc.specConstants, desc.specConstantsCount, desc.depthTargetFormat != RenderFormat::UNKNOWN);
 +            if (fragmentFunction == nullptr) {
 +                fprintf(stderr, "Metal graphics pipeline creation failed: fragment shader function is null.\n");
 +                vertexDescriptor->release();
@@ -699,7 +840,7 @@ index ebbbaa3..6c91662 100644
              descriptor->setFragmentFunction(fragmentFunction);
              fragmentFunction->release();
          }
-@@ -1547,8 +1905,24 @@ namespace plume {
+@@ -1547,8 +1977,24 @@ namespace plume {
              state.depthBiasSlopeFactor = desc.slopeScaledDepthBias;
          }
  
@@ -726,7 +867,25 @@ index ebbbaa3..6c91662 100644
              return;
          }
  
-@@ -1793,6 +2167,11 @@ namespace plume {
+@@ -1718,7 +2164,7 @@ namespace plume {
+ 
+         const uint32_t indexBase = setLayout->descriptorIndexBases[descriptorIndex];
+         const uint32_t bindingIndex = setLayout->descriptorBindingIndices[descriptorIndex];
+-        const auto &setLayoutBinding = setLayout->setBindings[indexBase];
++        const auto &setLayoutBinding = *setLayout->getBinding(bindingIndex);
+         const MTL::DataType dtype = mapDataType(setLayoutBinding.descriptorType);
+         MTL::Resource *nativeResource = nullptr;
+         RenderDescriptorRangeType descriptorType = getDescriptorType(bindingIndex);
+@@ -1777,7 +2223,7 @@ namespace plume {
+     }
+ 
+     MetalDrawable::~MetalDrawable() {
+-        mtl->release();
++        if (mtl) mtl->release();
+     }
+ 
+     std::unique_ptr<RenderTextureView> MetalDrawable::createTextureView(const RenderTextureViewDesc& desc) const {
+@@ -1793,6 +2239,11 @@ namespace plume {
  
      MetalSwapChain::MetalSwapChain(MetalCommandQueue *commandQueue, const RenderWindow renderWindow, uint32_t textureCount, const RenderFormat format) {
          this->layer = static_cast<CA::MetalLayer*>(renderWindow.view);
@@ -738,7 +897,7 @@ index ebbbaa3..6c91662 100644
          layer->setDevice(commandQueue->device->mtl);
          layer->setPixelFormat(mapPixelFormat(format));
  
-@@ -1819,7 +2198,10 @@ namespace plume {
+@@ -1819,7 +2270,14 @@ namespace plume {
      }
  
      bool MetalSwapChain::present(const uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, const uint32_t waitSemaphoreCount) {
@@ -747,10 +906,31 @@ index ebbbaa3..6c91662 100644
 +            return false;
 +        }
 +
++#if PLUME_IOS
++        auto submissionLock = lockSubmissions();
++#endif
++
          NS::AutoreleasePool *releasePool = NS::AutoreleasePool::alloc()->init();
  
          const MetalDrawable &drawable = drawables[textureIndex];
-@@ -1861,7 +2243,7 @@ namespace plume {
+@@ -1842,12 +2300,14 @@ namespace plume {
+             drawableMtl->present();
+         });
+ 
+-        presentBuffer->addCompletedHandler([drawableMtl, this](MTL::CommandBuffer* cmdBuffer) {
+-            currentAvailableDrawableIndex = (currentAvailableDrawableIndex + 1) % MAX_DRAWABLES;
++        presentBuffer->addCompletedHandler([drawableMtl](MTL::CommandBuffer* cmdBuffer) {
+             drawableMtl->release();
+         });
+ 
+         presentBuffer->commit();
++#if PLUME_IOS
++        trackSubmission(commandQueue->mtl, presentBuffer);
++#endif
+ 
+         releasePool->release();
+ 
+@@ -1861,7 +2321,7 @@ namespace plume {
      bool MetalSwapChain::resize() {
          getWindowSize(width, height);
  
@@ -759,7 +939,7 @@ index ebbbaa3..6c91662 100644
              return false;
          }
  
-@@ -1886,11 +2268,29 @@ namespace plume {
+@@ -1886,11 +2346,29 @@ namespace plume {
      }
  
      void MetalSwapChain::setVsyncEnabled(const bool vsyncEnabled) {
@@ -789,7 +969,7 @@ index ebbbaa3..6c91662 100644
      }
  
      uint32_t MetalSwapChain::getWidth() const {
-@@ -1910,6 +2310,10 @@ namespace plume {
+@@ -1910,25 +2388,42 @@ namespace plume {
          assert(textureIndex != nullptr);
          assert(*textureIndex < MAX_DRAWABLES);
  
@@ -800,7 +980,25 @@ index ebbbaa3..6c91662 100644
          NS::AutoreleasePool *releasePool = NS::AutoreleasePool::alloc()->init();
  
          // Create a command buffer just to encode the signal
-@@ -1923,6 +2327,7 @@ namespace plume {
++#if PLUME_IOS
++        auto submissionLock = lockSubmissions();
++#endif
+         MTL::CommandBuffer *acquireBuffer = commandQueue->mtl->commandBufferWithUnretainedReferences();
+         acquireBuffer->setLabel(MTLSTR("Acquire Drawable Command Buffer"));
+         const MetalCommandSemaphore *interfaceSemaphore = static_cast<MetalCommandSemaphore *>(signalSemaphore);
+         acquireBuffer->enqueue();
+         acquireBuffer->encodeSignalEvent(interfaceSemaphore->mtl, interfaceSemaphore->mtlEventValue);
+         acquireBuffer->commit();
++#if PLUME_IOS
++        trackSubmission(commandQueue->mtl, acquireBuffer);
++        submissionLock.unlock();
++#endif
+ 
++        MetalDrawable &drawable = drawables[currentAvailableDrawableIndex];
++        if (drawable.mtl) {
++            drawable.mtl->release();
++            drawable.mtl = nullptr;
++        }
          CA::MetalDrawable *nextDrawable = layer->nextDrawable();
          if (nextDrawable == nullptr) {
              fprintf(stderr, "No more drawables available for rendering.\n");
@@ -808,7 +1006,14 @@ index ebbbaa3..6c91662 100644
              return false;
          }
  
-@@ -1954,10 +2359,20 @@ namespace plume {
+         // Set the texture index and drawable data
+         *textureIndex = currentAvailableDrawableIndex;
+-        MetalDrawable &drawable = drawables[currentAvailableDrawableIndex];
++        currentAvailableDrawableIndex = (currentAvailableDrawableIndex + 1) % MAX_DRAWABLES;
+         drawable.desc.width = width;
+         drawable.desc.height = height;
+         drawable.desc.flags = RenderTextureFlag::RENDER_TARGET;
+@@ -1954,10 +2449,20 @@ namespace plume {
      }
  
      uint32_t MetalSwapChain::getRefreshRate() const {
@@ -829,7 +1034,129 @@ index ebbbaa3..6c91662 100644
          CocoaWindowAttributes attributes;
          windowWrapper->getWindowAttributes(&attributes);
          dstWidth = attributes.width;
-@@ -3308,6 +3723,9 @@ namespace plume {
+@@ -2084,12 +2589,15 @@ namespace plume {
+     }
+ 
+     MetalCommandList::~MetalCommandList() {
+-        mtl->release();
++        if (mtl) mtl->release();
+     }
+ 
+     void MetalCommandList::begin() {
++        const auto releasePool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+         assert(mtl == nullptr);
++        graphicsAddressResources.clear();
+         mtl = queue->mtl->commandBufferWithUnretainedReferences();
++        mtl->retain();
+         mtl->setLabel(MTLSTR("RT64 Command List"));
+     }
+ 
+@@ -2110,6 +2618,11 @@ namespace plume {
+     }
+ 
+     void MetalCommandList::commit() {
++        mtl->addCompletedHandler([](MTL::CommandBuffer *buffer) {
++            if (buffer->status() == MTL::CommandBufferStatusError) {
++                fprintf(stderr, "Metal command buffer failed: %s\n", buffer->error()->localizedDescription()->utf8String());
++            }
++        });
+         mtl->commit();
+         mtl->release();
+         mtl = nullptr;
+@@ -2245,7 +2758,7 @@ namespace plume {
+         pushConstants[rangeIndex].binding = range.binding;
+         pushConstants[rangeIndex].set = range.set;
+         pushConstants[rangeIndex].offset = range.offset;
+-        pushConstants[rangeIndex].size = alignUp(range.size);
++        pushConstants[rangeIndex].size = range.size;
+         pushConstants[rangeIndex].stageFlags = range.stageFlags;
+ 
+         dirtyComputeState.pushConstants = 1;
+@@ -2298,7 +2811,7 @@ namespace plume {
+         pushConstants[rangeIndex].binding = range.binding;
+         pushConstants[rangeIndex].set = range.set;
+         pushConstants[rangeIndex].offset = range.offset;
+-        pushConstants[rangeIndex].size = alignUp(range.size);
++        pushConstants[rangeIndex].size = range.size;
+         pushConstants[rangeIndex].stageFlags = range.stageFlags;
+ 
+         dirtyGraphicsState.pushConstants = 1;
+@@ -2316,7 +2829,11 @@ namespace plume {
+     }
+ 
+     void MetalCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
+-        assert(false && "Root descriptors are not supported in Metal.");
++        const auto *buffer = static_cast<const MetalBuffer *>(bufferReference.ref);
++        const uint64_t address = buffer->mtl->gpuAddress() + bufferReference.offset;
++        // Raw GPU addresses do not establish residency implicitly.
++        graphicsAddressResources.insert(buffer->mtl);
++        setGraphicsPushConstants(0, &address, sizeof(address) * rootDescriptorIndex, sizeof(address));
+     }
+ 
+     void MetalCommandList::setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) {
+@@ -3116,6 +3633,7 @@ namespace plume {
+ 
+         if (activeBlitEncoder == nullptr) {
+             activeBlitEncoder = mtl->blitCommandEncoder(device->sharedBlitDescriptor);
++            activeBlitEncoder->retain();
+             activeBlitEncoder->setLabel(MTLSTR("Copy Blit Encoder"));
+         }
+     }
+@@ -3136,6 +3654,7 @@ namespace plume {
+ 
+         if (activeResolveComputeEncoder == nullptr) {
+             activeResolveComputeEncoder = mtl->computeCommandEncoder();
++            activeResolveComputeEncoder->retain();
+             activeResolveComputeEncoder->setLabel(MTLSTR("Resolve Texture Encoder"));
+             activeResolveComputeEncoder->setComputePipelineState(device->resolveTexturePipelineState);
+         }
+@@ -3161,6 +3680,9 @@ namespace plume {
+             }
+         } else {
+             auto* renderEncoder = static_cast<MTL::RenderCommandEncoder*>(encoder);
++            for (auto* buffer : graphicsAddressResources) {
++                renderEncoder->useResource(buffer, MTL::ResourceUsageRead, MTL::RenderStageVertex | MTL::RenderStageFragment);
++            }
+             for (const auto* descriptorSet : currentEncoderDescriptorSets) {
+                 for (const auto& entry : descriptorSet->resourceEntries) {
+                     if (entry.resource != nullptr) {
+@@ -3203,6 +3725,14 @@ namespace plume {
+     }
+ 
+     MetalCommandQueue::~MetalCommandQueue() {
++#if PLUME_IOS
++        std::lock_guard lock(submissionMutex);
++        auto pending = pendingSubmissions.find(mtl);
++        if (pending != pendingSubmissions.end()) {
++            pending->second->release();
++            pendingSubmissions.erase(pending);
++        }
++#endif
+         mtl->release();
+     }
+ 
+@@ -3216,6 +3746,10 @@ namespace plume {
+     }
+ 
+     void MetalCommandQueue::executeCommandLists(const RenderCommandList **commandLists, const uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, const uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, const uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) {
++#if PLUME_IOS
++        auto submissionLock = lockSubmissions();
++#endif
++        const auto releasePool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+         assert(commandLists != nullptr);
+         assert(commandListCount > 0);
+ 
+@@ -3258,6 +3792,9 @@ namespace plume {
+         }
+ 
+         MetalCommandList *mutableCommandList = const_cast<MetalCommandList*>(interfaceCommandList);
++#if PLUME_IOS
++        trackSubmission(mtl, mutableCommandList->mtl);
++#endif
+         mutableCommandList->commit();
+     }
+ 
+@@ -3308,6 +3845,9 @@ namespace plume {
          this->renderInterface = renderInterface;
  
          // Device Selection
@@ -839,7 +1166,7 @@ index ebbbaa3..6c91662 100644
          const NS::Array* devices = MTL::CopyAllDevices();
          MTL::Device *preferredDevice = nullptr;
          for (NS::UInteger i = 0; i < devices->count(); i++) {
-@@ -3320,12 +3738,31 @@ namespace plume {
+@@ -3320,12 +3860,31 @@ namespace plume {
          }
  
          mtl = preferredDevice ? preferredDevice : MTL::CreateSystemDefaultDevice();;
@@ -872,7 +1199,7 @@ index ebbbaa3..6c91662 100644
  
          // Setup blit, clear and resolve shaders / pipelines
          createClearShaderLibrary();
-@@ -3337,7 +3774,7 @@ namespace plume {
+@@ -3337,7 +3896,7 @@ namespace plume {
          // TODO: Support Raytracing.
          // capabilities.raytracing = mtl->supportsRaytracing();
          capabilities.maxTextureSize = mtl->supportsFamily(MTL::GPUFamilyApple3) ? 16384 : 8192;
@@ -881,7 +1208,7 @@ index ebbbaa3..6c91662 100644
          capabilities.resolveModes = false;
  #if PLUME_IOS
          capabilities.descriptorIndexing = mtl->supportsFamily(MTL::GPUFamilyApple3);
-@@ -3345,11 +3782,11 @@ namespace plume {
+@@ -3345,11 +3904,11 @@ namespace plume {
          capabilities.descriptorIndexing = true;
  #endif
          capabilities.scalarBlockLayout = true;
@@ -896,7 +1223,7 @@ index ebbbaa3..6c91662 100644
          capabilities.gpuUploadHeap = capabilities.uma;
          capabilities.queryPools = false;
  
-@@ -3357,17 +3794,19 @@ namespace plume {
+@@ -3357,17 +3916,19 @@ namespace plume {
      }
  
      MetalDevice::~MetalDevice() {
@@ -922,7 +1249,7 @@ index ebbbaa3..6c91662 100644
      }
  
      std::unique_ptr<RenderDescriptorSet> MetalDevice::createDescriptorSet(const RenderDescriptorSetDesc &desc) {
-@@ -3635,16 +4074,24 @@ namespace plume {
+@@ -3635,16 +4196,24 @@ namespace plume {
  
      MetalInterface::MetalInterface() {
          NS::AutoreleasePool *releasePool = NS::AutoreleasePool::alloc()->init();
@@ -949,10 +1276,33 @@ index ebbbaa3..6c91662 100644
  
      MetalInterface::~MetalInterface() {}
 diff --git a/plume_metal.h b/plume_metal.h
-index fd367ed..557686b 100644
+index fd367ed..dcdbb62 100644
 --- a/plume_metal.h
 +++ b/plume_metal.h
-@@ -608,16 +608,16 @@ namespace plume {
+@@ -371,6 +371,7 @@ namespace plume {
+         const MetalDescriptorSet* computeDescriptorSets[MAX_DESCRIPTOR_SET_BINDINGS] = {};
+ 
+         std::unordered_set<MetalDescriptorSet*> currentEncoderDescriptorSets;
++        std::unordered_set<MTL::Buffer*> graphicsAddressResources;
+         void bindEncoderResources(MTL::CommandEncoder* encoder, bool isCompute);
+ 
+         MetalCommandList(const MetalCommandQueue *queue);
+@@ -543,12 +544,13 @@ namespace plume {
+         NS::String *functionName = nullptr;
+         RenderShaderFormat format = RenderShaderFormat::UNKNOWN;
+         MTL::Library *library = nullptr;
++        MTL::Library *libraryWithoutDepth = nullptr;
+         NS::String *debugName = nullptr;
+ 
+         MetalShader(const MetalDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
+         ~MetalShader() override;
+         virtual void setName(const std::string &name) override;
+-        MTL::Function* createFunction(const RenderSpecConstant *specConstants, uint32_t specConstantsCount) const;
++        MTL::Function* createFunction(const RenderSpecConstant *specConstants, uint32_t specConstantsCount, bool hasDepthAttachment = true) const;
+     };
+ 
+     struct MetalSampler : RenderSampler {
+@@ -608,16 +610,16 @@ namespace plume {
          RenderDeviceDescription description;
  
          // Resolve functionality
@@ -977,3 +1327,222 @@ index fd367ed..557686b 100644
  
          std::mutex clearPipelineStateMutex;
          std::unordered_map<uint64_t, MTL::RenderPipelineState *> clearRenderPipelineStates;
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 9103ca8..9a41ec4 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -8,6 +8,9 @@
+ #define VMA_IMPLEMENTATION
+ #define VOLK_IMPLEMENTATION 
+ 
++#if defined(__APPLE__) && defined(SDL_VULKAN_ENABLED)
++#include "plume_volk_rename_ios.h"
++#endif
+ #include "plume_vulkan.h"
+ 
+ #include <algorithm>
+@@ -19,6 +22,14 @@
+ #   include "render/plume_dlss.h"
+ #endif
+ 
++#if defined(__APPLE__) && defined(SDL_VULKAN_ENABLED)
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL mvkGetInstanceProcAddr(VkInstance instance, const char *pName) __asm("_vkGetInstanceProcAddr");
++
++#define PLUME_IOS_VULKAN_LOG(...) do { fprintf(stderr, "[iOS plume] " __VA_ARGS__); fflush(stderr); } while (false)
++#else
++#define PLUME_IOS_VULKAN_LOG(...) do { } while (false)
++#endif
++
+ #ifndef NDEBUG
+ #   define VULKAN_VALIDATION_LAYER_ENABLED
+ #   define VULKAN_OBJECT_NAMES_ENABLED
+@@ -88,6 +99,19 @@ namespace plume {
+         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+     };
+ 
++    static std::unordered_set<std::string> getRequiredDeviceExtensions(uint32_t apiVersion) {
++        std::unordered_set<std::string> extensions = RequiredDeviceExtensions;
++
++        // MoltenVK and other Vulkan 1.2+ implementations expose these as core features
++        // and no longer enumerate them as separate device extensions.
++        if (apiVersion >= VK_API_VERSION_1_2) {
++            extensions.erase(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
++            extensions.erase(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
++        }
++
++        return extensions;
++    }
++
+     // Common functions.
+ 
+     static uint32_t roundUp(uint32_t value, uint32_t powerOf2Alignment) {
+@@ -2086,6 +2110,7 @@ namespace plume {
+             fprintf(stderr, "SDL_Vulkan_CreateSurface failed with error %s.\n", SDL_GetError());
+             return;
+         }
++        PLUME_IOS_VULKAN_LOG("SDL Vulkan surface created: %p\n", (void *)surface);
+ #   elif defined(__ANDROID__)
+         assert(renderWindow != nullptr);
+         VkAndroidSurfaceCreateInfoKHR surfaceCreateInfo = {};
+@@ -2112,6 +2137,12 @@ namespace plume {
+             fprintf(stderr, "vkCreateXlibSurfaceKHR failed with error code 0x%X.\n", res);
+             return;
+         }
++#   elif defined(__APPLE__) && defined(SDL_VULKAN_ENABLED)
++        VulkanInterface *renderInterface = commandQueue->device->renderInterface;
++        if (!SDL_Vulkan_CreateSurface(renderWindow, renderInterface->instance, &surface)) {
++            fprintf(stderr, "SDL_Vulkan_CreateSurface failed: %s.\n", SDL_GetError());
++            return;
++        }
+ #   elif defined(__APPLE__)
+         assert(renderWindow.window != 0);
+         assert(renderWindow.view != 0);
+@@ -2275,9 +2306,16 @@ namespace plume {
+ #else
+         if ((res != VK_SUCCESS) && (res != VK_SUBOPTIMAL_KHR)) {
+ #endif
++            PLUME_IOS_VULKAN_LOG("present failed with error code 0x%X.\n", res);
+             return false;
+         }
+ 
++        static uint32_t s_iosPresentLogCount = 0;
++        if (s_iosPresentLogCount < 20) {
++            PLUME_IOS_VULKAN_LOG("present #%u image=%u waitSemaphores=%u\n", s_iosPresentLogCount, textureIndex, waitSemaphoreCount);
++        }
++        s_iosPresentLogCount++;
++
+         return true;
+     }
+ 
+@@ -2325,6 +2363,17 @@ namespace plume {
+             return false;
+         }
+ 
++        static uint32_t s_iosResizeLogCount = 0;
++        if (s_iosResizeLogCount < 20) {
++            PLUME_IOS_VULKAN_LOG("resize #%u extent=%ux%u requestedImages=%u presentMode=%d\n",
++                s_iosResizeLogCount,
++                createInfo.imageExtent.width,
++                createInfo.imageExtent.height,
++                textureCount,
++                int(requiredPresentMode));
++        }
++        s_iosResizeLogCount++;
++
+         // Store the chosen present mode to identify later whether the swapchain needs to be recreated.
+         createdPresentMode = requiredPresentMode;
+ 
+@@ -2443,7 +2492,7 @@ namespace plume {
+         // The attributes width and height members do not include the border.
+         dstWidth = attributes.width;
+         dstHeight = attributes.height;
+-#   elif defined(__APPLE__)
++#   elif defined(__APPLE__) && !defined(SDL_VULKAN_ENABLED)
+         CocoaWindowAttributes attributes;
+         windowWrapper->getWindowAttributes(&attributes);
+         dstWidth = attributes.width;
+@@ -3754,6 +3803,10 @@ namespace plume {
+             return;
+         }
+ 
++        VkPhysicalDeviceProperties selectedDeviceProperties;
++        vkGetPhysicalDeviceProperties(physicalDevice, &selectedDeviceProperties);
++        const std::unordered_set<std::string> requiredDeviceExtensions = getRequiredDeviceExtensions(selectedDeviceProperties.apiVersion);
++
+         // Check for extensions.
+         uint32_t extensionCount;
+         vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr);
+@@ -3761,7 +3814,7 @@ namespace plume {
+         std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+         vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, availableExtensions.data());
+ 
+-        std::unordered_set<std::string> missingRequiredExtensions = RequiredDeviceExtensions;
++        std::unordered_set<std::string> missingRequiredExtensions = requiredDeviceExtensions;
+         std::unordered_set<std::string> supportedOptionalExtensions;
+ #   if DLSS_ENABLED
+         const std::unordered_set<std::string> dlssExtensions = DLSS::getRequiredDeviceExtensionsVulkan(this);
+@@ -3969,7 +4022,7 @@ namespace plume {
+         }
+ 
+         std::vector<const char *> enabledExtensions;
+-        for (const std::string &extension : RequiredDeviceExtensions) {
++        for (const std::string &extension : requiredDeviceExtensions) {
+             enabledExtensions.push_back(extension.c_str());
+         }
+ 
+@@ -4398,11 +4451,27 @@ namespace plume {
+ #else
+     VulkanInterface::VulkanInterface() {
+ #endif
+-        VkResult res = volkInitialize();
++        VkResult res = VK_SUCCESS;
++#if defined(__APPLE__) && defined(SDL_VULKAN_ENABLED)
++        volkInitializeCustom(mvkGetInstanceProcAddr);
++#else
++        res = volkInitialize();
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
+             return;
+         }
++#endif
++
++#if SDL_VULKAN_ENABLED
++        if (sdlWindow != nullptr) {
++            if (SDL_Vulkan_LoadLibrary(nullptr) != 0) {
++                fprintf(stderr, "SDL_Vulkan_LoadLibrary failed: %s.\n", SDL_GetError());
++                return;
++            }
++
++            sdlVulkanLoaded = true;
++        }
++#endif
+ 
+         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+         appInfo.pApplicationName = "plume";
+@@ -4540,6 +4609,12 @@ namespace plume {
+         if (instance != nullptr) {
+             vkDestroyInstance(instance, nullptr);
+         }
++
++#if SDL_VULKAN_ENABLED
++        if (sdlVulkanLoaded) {
++            SDL_Vulkan_UnloadLibrary();
++        }
++#endif
+     }
+ 
+     std::unique_ptr<RenderDevice> VulkanInterface::createDevice(const std::string &preferredDeviceName) {
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 73022bb..a611e8f 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -22,8 +22,10 @@
+ #define VK_USE_PLATFORM_XLIB_KHR
+ #elif defined(__APPLE__)
+ #define VK_USE_PLATFORM_METAL_EXT
++#ifndef SDL_VULKAN_ENABLED
+ #include "plume_apple.h"
+ #endif
++#endif
+ 
+ // For VK_KHR_portability_subset
+ #define VK_ENABLE_BETA_EXTENSIONS
+@@ -226,7 +228,7 @@ namespace plume {
+         VulkanCommandQueue *commandQueue = nullptr;
+         VkSurfaceKHR surface = VK_NULL_HANDLE;
+         RenderWindow renderWindow = {};
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(SDL_VULKAN_ENABLED)
+         std::unique_ptr<CocoaWindow> windowWrapper;
+ #endif
+         uint32_t textureCount = 0;
+@@ -455,6 +457,9 @@ namespace plume {
+         VkApplicationInfo appInfo = {};
+         RenderInterfaceCapabilities capabilities;
+         std::vector<std::string> deviceNames;
++#   if SDL_VULKAN_ENABLED
++        bool sdlVulkanLoaded = false;
++#   endif
+ 
+ #   if SDL_VULKAN_ENABLED
+         VulkanInterface(RenderWindow sdlWindow);

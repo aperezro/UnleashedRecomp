@@ -60,14 +60,14 @@ std::unordered_map<EButtonIcon, float> g_iconHeights =
     { EButtonIcon::Escape, 40 },
 };
 
-std::tuple<std::tuple<ImVec2, ImVec2>, GuestTexture*> GetButtonIcon(EButtonIcon icon)
+std::tuple<std::tuple<ImVec2, ImVec2>, GuestTexture*> GetButtonIcon(EButtonIcon icon, bool forceXbox)
 {
     std::tuple<ImVec2, ImVec2> btn;
     GuestTexture* texture;
 
-    auto isPlayStation = Config::ControllerIcons == EControllerIcons::Auto
+    auto isPlayStation = !forceXbox && (Config::ControllerIcons == EControllerIcons::Auto
         ? hid::g_inputDeviceController == hid::EInputDevice::PlayStation
-        : Config::ControllerIcons == EControllerIcons::PlayStation;
+        : Config::ControllerIcons == EControllerIcons::PlayStation);
 
     auto yOffsetCmn = isPlayStation ? 42 : 0;
     auto yOffsetStartBack = isPlayStation ? 46 : 0;

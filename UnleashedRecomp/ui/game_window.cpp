@@ -6,8 +6,8 @@
 #include <app.h>
 #include <sdl_listener.h>
 #include <SDL_syswm.h>
-#ifdef __APPLE__
-#include <SDL_metal.h>
+#if defined(UNLEASHED_RECOMP_IOS) && defined(UNLEASHED_RECOMP_METAL)
+#include <plume_apple.h>
 #endif
 
 #if _WIN32
@@ -21,10 +21,71 @@
 bool m_isFullscreenKeyReleased = true;
 bool m_isResizing = false;
 
+#ifdef UNLEASHED_RECOMP_IOS
+static std::mutex g_imGuiEventsMutex;
+static std::vector<SDL_Event> g_imGuiEvents;
+static SDL_threadID g_uiThreadId;
+
+void GameWindow::WaitUntilActive()
+{
+    while (!s_isActive.load())
+    {
+        if (SDL_ThreadID() == g_uiThreadId)
+        {
+            SDL_PumpEvents();
+            SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+            SDL_Delay(10);
+        }
+        else
+        {
+            s_isActive.wait(false);
+        }
+    }
+}
+
+void GameWindow::ProcessImGuiEvents()
+{
+    std::vector<SDL_Event> events;
+    {
+        std::lock_guard lock(g_imGuiEventsMutex);
+        events.swap(g_imGuiEvents);
+    }
+    for (const auto& event : events)
+        ImGui_ImplSDL2_ProcessEvent(&event);
+}
+#endif
+
 int Window_OnSDLEvent(void*, SDL_Event* event)
 {
+#ifdef UNLEASHED_RECOMP_IOS
+    // Lifecycle events must not be swallowed by an installer/dialog listener.
+    if (event->type == SDL_APP_WILLENTERBACKGROUND)
+    {
+        GameWindow::s_isActive = false;
+        GameWindow::s_isFocused = false;
+#ifdef UNLEASHED_RECOMP_METAL
+        plume::setMetalApplicationActive(false);
+#endif
+    }
+    else if (event->type == SDL_APP_DIDENTERFOREGROUND)
+    {
+#ifdef UNLEASHED_RECOMP_METAL
+        plume::setMetalApplicationActive(true);
+#endif
+        GameWindow::s_isFocused = true;
+        GameWindow::s_isActive = true;
+        GameWindow::s_isActive.notify_all();
+    }
+
+    // UIKit pumps on the main thread; ImGui is owned by the presenting thread.
+    {
+        std::lock_guard lock(g_imGuiEventsMutex);
+        g_imGuiEvents.push_back(*event);
+    }
+#else
     if (ImGui::GetIO().BackendPlatformUserData != nullptr)
         ImGui_ImplSDL2_ProcessEvent(event);
+#endif
 
     for (auto listener : GetEventListeners())
     {
@@ -160,12 +221,14 @@ int Window_OnSDLEvent(void*, SDL_Event* event)
 
 void GameWindow::Init(const char* sdlVideoDriver)
 {
+#ifdef UNLEASHED_RECOMP_IOS
+    g_uiThreadId = SDL_ThreadID();
+#endif
 #ifdef __linux__
     SDL_SetHint("SDL_APP_ID", "io.github.hedge_dev.unleashedrecomp");
 #endif
 
 #ifdef UNLEASHED_RECOMP_IOS
-    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeRight");
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
     SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
 #endif
@@ -192,13 +255,6 @@ void GameWindow::Init(const char* sdlVideoDriver)
     s_y = Config::WindowY;
     s_width = Config::WindowWidth;
     s_height = Config::WindowHeight;
-
-#ifdef UNLEASHED_RECOMP_IOS
-    s_x = SDL_WINDOWPOS_UNDEFINED;
-    s_y = SDL_WINDOWPOS_UNDEFINED;
-    s_width = 1280;
-    s_height = 720;
-#endif
 
     if (s_x == -1 && s_y == -1)
         s_x = s_y = SDL_WINDOWPOS_CENTERED;
@@ -233,18 +289,17 @@ void GameWindow::Init(const char* sdlVideoDriver)
         DWM_WINDOW_CORNER_PREFERENCE wcp = DWMWCP_DONOTROUND;
         DwmSetWindowAttribute(s_renderWindow, DWMWA_WINDOW_CORNER_PREFERENCE, &wcp, sizeof(wcp));
     }
+#elif defined(UNLEASHED_RECOMP_METAL) && defined(UNLEASHED_RECOMP_IOS)
+    static SDL_MetalView metalView = SDL_Metal_CreateView(s_pWindow);
+    s_renderWindow.window = metalView;
+    s_renderWindow.view = SDL_Metal_GetLayer(metalView);
 #elif defined(SDL_VULKAN_ENABLED)
     s_renderWindow = s_pWindow;
 #elif defined(__linux__)
     s_renderWindow = { info.info.x11.display, info.info.x11.window };
 #elif defined(__APPLE__)
-    s_metalView = SDL_Metal_CreateView(s_pWindow);
-#ifdef UNLEASHED_RECOMP_IOS
-    s_renderWindow.window = s_metalView;
-#else
     s_renderWindow.window = info.info.cocoa.window;
-#endif
-    s_renderWindow.view = s_metalView != nullptr ? SDL_Metal_GetLayer(s_metalView) : nullptr;
+    s_renderWindow.view = SDL_Metal_GetLayer(SDL_Metal_CreateView(s_pWindow));
 #else
     static_assert(false, "Unknown platform.");
 #endif
@@ -463,10 +518,10 @@ uint32_t GameWindow::GetWindowFlags()
     if (Config::Fullscreen)
         flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 
-#ifdef SDL_VULKAN_ENABLED
-    flags |= SDL_WINDOW_VULKAN;
-#elif defined(__APPLE__)
+#ifdef UNLEASHED_RECOMP_METAL
     flags |= SDL_WINDOW_METAL;
+#elif defined(SDL_VULKAN_ENABLED)
+    flags |= SDL_WINDOW_VULKAN;
 #endif
 
     return flags;

@@ -6,6 +6,8 @@ if (NOT UNLEASHED_RECOMP_SKIP_TARGET_TOOL_EXECUTABLES)
     add_subdirectory(${UNLEASHED_RECOMP_TOOLS_ROOT}/XenonRecomp)
     add_subdirectory(${UNLEASHED_RECOMP_TOOLS_ROOT}/XenosRecomp)
 else()
+    # Shaders still need the host DXC executable when target tools are skipped.
+    add_subdirectory(${UNLEASHED_RECOMP_TOOLS_ROOT}/XenosRecomp/thirdparty/dxc-bin)
     set(THIRDPARTY_ROOT ${UNLEASHED_RECOMP_TOOLS_ROOT}/XenonRecomp/thirdparty)
     add_subdirectory(${UNLEASHED_RECOMP_TOOLS_ROOT}/XenonRecomp/thirdparty)
     add_subdirectory(${UNLEASHED_RECOMP_TOOLS_ROOT}/XenonRecomp/XenonUtils)

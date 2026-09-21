@@ -2,7 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="$ROOT/out/build/ios-device-release"
+IOS_PRESET="${IOS_PRESET:-ios-native-metal-release}"
+BUILD_DIR="$ROOT/out/build/$IOS_PRESET"
+export VCPKG_ROOT="${VCPKG_ROOT:-$ROOT/thirdparty/vcpkg}"
 HOST_BUILD_DIR="$ROOT/out/build/macos-release"
 IPA_DIR="$ROOT/out/ipa"
 PAYLOAD_DIR="$IPA_DIR/Payload"
@@ -51,7 +53,7 @@ fi
 cmake --preset macos-release
 cmake --build "$HOST_BUILD_DIR" --target XenonRecomp XenosRecomp x_decompress file_to_c -j "${JOBS:-8}"
 
-cmake --preset ios-device-release
+cmake --preset "$IOS_PRESET"
 cmake --build "$BUILD_DIR" --target UnleashedRecomp -j "${JOBS:-8}"
 
 if [[ ! -d "$APP_PATH" ]]; then
@@ -62,6 +64,10 @@ fi
 rm -rf "$IPA_DIR"
 mkdir -p "$PAYLOAD_DIR"
 cp -R "$APP_PATH" "$PAYLOAD_DIR/"
+
+if [[ -n "${BUNDLE_IDENTIFIER:-}" ]]; then
+    plutil -replace CFBundleIdentifier -string "$BUNDLE_IDENTIFIER" "$PAYLOAD_DIR/Unleashed Recompiled.app/Info.plist"
+fi
 
 if [[ -z "${CODESIGN_IDENTITY:-}" ]] && security find-identity -v -p codesigning | grep -q "$DEFAULT_SIGNING_IDENTITY"; then
     CODESIGN_IDENTITY="$DEFAULT_SIGNING_IDENTITY"

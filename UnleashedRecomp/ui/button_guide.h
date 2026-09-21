@@ -30,6 +30,8 @@ enum class EButtonAlignment
     Right
 };
 
+std::tuple<std::tuple<ImVec2, ImVec2>, GuestTexture*> GetButtonIcon(EButtonIcon icon, bool forceXbox = false);
+
 enum class EFontQuality
 {
     Low,

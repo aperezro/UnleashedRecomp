@@ -60,11 +60,28 @@
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
     <key>MinimumOSVersion</key>
-    <string>16.0</string>
+    <string>${UNLEASHED_RECOMP_IOS_MINIMUM_VERSION}</string>
     <key>UIFileSharingEnabled</key>
     <true/>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+        <key>UISceneConfigurations</key>
+        <dict>
+            <key>UIWindowSceneSessionRoleApplication</key>
+            <array>
+                <dict>
+                    <key>UISceneConfigurationName</key>
+                    <string>Unleashed</string>
+                    <key>UISceneDelegateClassName</key>
+                    <string>SDLUIKitSceneDelegate</string>
+                </dict>
+            </array>
+        </dict>
+    </dict>
     <key>UILaunchScreen</key>
     <dict/>
     <key>UIRequiredDeviceCapabilities</key>
@@ -76,6 +93,7 @@
     <true/>
     <key>UISupportedInterfaceOrientations</key>
     <array>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
         <string>UIInterfaceOrientationLandscapeRight</string>
     </array>
     <key>UIDeviceFamily</key>

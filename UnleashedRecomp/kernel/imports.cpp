@@ -17,68 +17,6 @@
 #include <ntstatus.h>
 #endif
 
-static std::atomic<uint32_t> g_keSetEventGeneration;
-
-static void NotifyWaitForMultipleObjects()
-{
-    ++g_keSetEventGeneration;
-    g_keSetEventGeneration.notify_all();
-}
-
-#ifdef UNLEASHED_RECOMP_IOS
-static uint32_t GetGuestLinkRegisterForLog()
-{
-#ifndef PPC_CONFIG_SKIP_LR
-    if (auto* ctx = GetPPCContext())
-        return uint32_t(ctx->lr);
-#endif
-
-    return 0;
-}
-
-static bool ShouldLogKernelWait(uint32_t count)
-{
-    return count <= 128 || (count % 512) == 0;
-}
-
-static const char* GetDispatcherTypeName(uint32_t type)
-{
-    switch (type)
-    {
-    case 0:
-        return "NotificationEvent";
-    case 1:
-        return "SynchronizationEvent";
-    case 5:
-        return "Semaphore";
-    default:
-        return "Unknown";
-    }
-}
-
-static void LogKernelWait(const char* name, uint32_t object, uint32_t timeout, int64_t rawTimeout, uint32_t type, uint32_t signalState, uint32_t extra = 0)
-{
-    static std::atomic<uint32_t> s_waitLogCount;
-    const uint32_t count = ++s_waitLogCount;
-    if (!ShouldLogKernelWait(count))
-        return;
-
-    LOGFN("iOS wait #{} {} object=0x{:08X} type={}({}) signal={} timeout={} rawTimeout={} extra={} lr=0x{:08X} thread=0x{:08X}",
-        count,
-        name,
-        object,
-        GetDispatcherTypeName(type),
-        type,
-        signalState,
-        timeout,
-        rawTimeout,
-        extra,
-        GetGuestLinkRegisterForLog(),
-        GuestThread::GetCurrentThreadId());
-}
-
-#endif
-
 struct Event final : KernelObject, HostObject<XKEVENT>
 {
     bool manualReset;
@@ -121,7 +59,8 @@ struct Event final : KernelObject, HostObject<XKEVENT>
                 while (true)
                 {
                     bool expected = true;
-                    if (signaled.compare_exchange_weak(expected, false))
+                    // A spurious failure must not put a signaled event to sleep.
+                    if (signaled.compare_exchange_strong(expected, false))
                         break;
 
                     signaled.wait(expected);
@@ -145,8 +84,6 @@ struct Event final : KernelObject, HostObject<XKEVENT>
         else
             signaled.notify_one();
 
-        NotifyWaitForMultipleObjects();
-
         return TRUE;
     }
 
@@ -156,6 +93,8 @@ struct Event final : KernelObject, HostObject<XKEVENT>
         return TRUE;
     }
 };
+
+static std::atomic<uint32_t> g_keSetEventGeneration;
 
 struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 {
@@ -179,7 +118,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
             uint32_t currentCount = count.load();
             if (currentCount != 0)
             {
-                if (count.compare_exchange_weak(currentCount, currentCount - 1))
+                if (count.compare_exchange_strong(currentCount, currentCount - 1))
                     return STATUS_SUCCESS;
             }
 
@@ -220,43 +159,8 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 
         count += releaseCount;
         count.notify_all();
-        NotifyWaitForMultipleObjects();
     }
 };
-
-#ifdef UNLEASHED_RECOMP_IOS
-static const char* GetKernelObjectName(KernelObject* object)
-{
-    if (dynamic_cast<Event*>(object) != nullptr)
-        return "Event";
-
-    if (dynamic_cast<Semaphore*>(object) != nullptr)
-        return "Semaphore";
-
-    if (dynamic_cast<GuestThreadHandle*>(object) != nullptr)
-        return "GuestThread";
-
-    return "KernelObject";
-}
-
-static void LogKernelHandleWait(const char* name, uint32_t handle, KernelObject* object, uint32_t timeout, int64_t rawTimeout)
-{
-    static std::atomic<uint32_t> s_handleWaitLogCount;
-    const uint32_t count = ++s_handleWaitLogCount;
-    if (!ShouldLogKernelWait(count))
-        return;
-
-    LOGFN("iOS handle wait #{} {} handle=0x{:08X} objectType={} timeout={} rawTimeout={} lr=0x{:08X} thread=0x{:08X}",
-        count,
-        name,
-        handle,
-        GetKernelObjectName(object),
-        timeout,
-        rawTimeout,
-        GetGuestLinkRegisterForLog(),
-        GuestThread::GetCurrentThreadId());
-}
-#endif
 
 inline void CloseKernelObject(XDISPATCHER_HEADER& header)
 {
@@ -505,11 +409,7 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Al
 
     if (IsKernelObject(Handle))
     {
-        auto* object = GetKernelObject(Handle);
-#ifdef UNLEASHED_RECOMP_IOS
-        LogKernelHandleWait("NtWaitForSingleObjectEx", Handle, object, timeout, Timeout ? int64_t(*Timeout) : 0);
-#endif
-        return object->Wait(timeout);
+        return GetKernelObject(Handle)->Wait(timeout);
     }
     else
     {
@@ -670,21 +570,6 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* 
 
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
 
-#ifdef UNLEASHED_RECOMP_IOS
-    static std::atomic<uint32_t> s_delayLogCount;
-    const uint32_t delayLogCount = ++s_delayLogCount;
-    if (timeout == INFINITE || timeout >= 500 || delayLogCount <= 16)
-    {
-        LOGFN("iOS delay #{} timeout={} rawTimeout={} waitMode={} lr=0x{:08X} thread=0x{:08X}",
-            delayLogCount,
-            timeout,
-            Timeout ? int64_t(*Timeout) : 0,
-            WaitMode,
-            GetGuestLinkRegisterForLog(),
-            GuestThread::GetCurrentThreadId());
-    }
-#endif
-
 #ifdef _WIN32
     Sleep(timeout);
 #else
@@ -815,7 +700,8 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
     {
         uint32_t previousOwner = 0;
 
-        if (owningThread.compare_exchange_weak(previousOwner, thisThread) || previousOwner == thisThread)
+        // The following wait must only observe a genuinely occupied lock.
+        if (owningThread.compare_exchange_strong(previousOwner, thisThread) || previousOwner == thisThread)
         {
             cs->RecursionCount++;
             return;
@@ -1115,6 +1001,9 @@ bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait)
 {
     bool result = QueryKernelObject<Event>(*pEvent)->Set();
 
+    ++g_keSetEventGeneration;
+    g_keSetEventGeneration.notify_all();
+
     return result;
 }
 
@@ -1127,15 +1016,6 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, 
 {
     const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
     assert(timeout == INFINITE);
-
-#ifdef UNLEASHED_RECOMP_IOS
-    LogKernelWait("KeWaitForSingleObject",
-        g_memory.MapVirtual(Object),
-        timeout,
-        Timeout ? int64_t(*Timeout) : 0,
-        Object->Type,
-        Object->SignalState);
-#endif
 
     switch (Object->Type)
     {
@@ -1329,7 +1209,7 @@ bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
 
     uint32_t previousOwner = 0;
 
-    if (owningThread.compare_exchange_weak(previousOwner, thisThread) || previousOwner == thisThread)
+    if (owningThread.compare_exchange_strong(previousOwner, thisThread) || previousOwner == thisThread)
     {
         cs->RecursionCount++;
         return true;
@@ -1447,12 +1327,6 @@ uint32_t NtResumeThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
 
 uint32_t NtSetEvent(Event* handle, uint32_t* previousState)
 {
-#ifdef UNLEASHED_RECOMP_IOS
-    LOGFN("iOS NtSetEvent handle=0x{:08X} lr=0x{:08X} thread=0x{:08X}",
-        g_memory.MapVirtual(handle),
-        GetGuestLinkRegisterForLog(),
-        GuestThread::GetCurrentThreadId());
-#endif
     handle->Set();
     return 0;
 }
@@ -1633,17 +1507,6 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
 
     const uint64_t timeout = GuestTimeoutToMilliseconds(Timeout);
     assert(timeout == INFINITE);
-
-#ifdef UNLEASHED_RECOMP_IOS
-    auto* firstObject = Count > 0 ? Objects[0].get() : nullptr;
-    LogKernelWait("KeWaitForMultipleObjects",
-        firstObject != nullptr ? g_memory.MapVirtual(firstObject) : 0,
-        uint32_t(timeout),
-        Timeout ? int64_t(*Timeout) : 0,
-        firstObject != nullptr ? firstObject->Type : 0xFFFFFFFF,
-        firstObject != nullptr ? uint32_t(firstObject->SignalState) : 0,
-        (Count << 8) | WaitType);
-#endif
 
     if (WaitType == 0) // Wait all
     {

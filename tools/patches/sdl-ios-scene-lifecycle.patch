@@ -1,0 +1,183 @@
+diff --git a/src/video/uikit/SDL_uikitappdelegate.h b/src/video/uikit/SDL_uikitappdelegate.h
+index c40dae079..2cee647fe 100644
+--- a/src/video/uikit/SDL_uikitappdelegate.h
++++ b/src/video/uikit/SDL_uikitappdelegate.h
+@@ -36,6 +36,13 @@
+ 
+ - (void)hideLaunchScreen;
+ 
++#ifdef SDL_UIKIT_USE_SCENES
++/* Unleashed Recompiled: single-scene lifecycle for iOS 13 and later. */
++@property (nonatomic, strong) UIWindowScene *windowScene;
++- (void)startMainForScene:(UIWindowScene *)scene;
++- (void)sendDropFileForURL:(NSURL *)url;
++#endif
++
+ /* This property is marked as optional, and is only intended to be used when
+  * the app's UI is storyboard-based. SDL is not storyboard-based, however
+  * several major third-party ad APIs (e.g. Google admob) incorrectly assume this
+diff --git a/src/video/uikit/SDL_uikitappdelegate.m b/src/video/uikit/SDL_uikitappdelegate.m
+index b7f48edb9..42b789c3b 100644
+--- a/src/video/uikit/SDL_uikitappdelegate.m
++++ b/src/video/uikit/SDL_uikitappdelegate.m
+@@ -351,6 +351,9 @@ - (NSUInteger)supportedInterfaceOrientations
+ 
+ @implementation SDLUIKitDelegate {
+     UIWindow *launchWindow;
++#ifdef SDL_UIKIT_USE_SCENES
++    BOOL startedMain;
++#endif
+ }
+ 
+ /* convenience method */
+@@ -414,7 +417,7 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+ {
+     NSBundle *bundle = [NSBundle mainBundle];
+ 
+-#ifdef SDL_IPHONE_LAUNCHSCREEN
++#if defined(SDL_IPHONE_LAUNCHSCREEN) && !defined(SDL_UIKIT_USE_SCENES)
+     /* The normal launch screen is displayed until didFinishLaunching returns,
+      * but SDL_main is called after that happens and there may be a noticeable
+      * delay between the start of SDL_main and when the first real frame is
+@@ -470,11 +473,32 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+                         SDL_IdleTimerDisabledChanged, NULL);
+ 
+     SDL_SetMainReady();
++#ifndef SDL_UIKIT_USE_SCENES
+     [self performSelector:@selector(postFinishLaunch) withObject:nil afterDelay:0.0];
++#endif
+ 
+     return YES;
+ }
+ 
++#ifdef SDL_UIKIT_USE_SCENES
++- (UISceneConfiguration *)application:(UIApplication *)application configurationForConnectingSceneSession:(UISceneSession *)session options:(UISceneConnectionOptions *)options
++{
++    UISceneConfiguration *configuration = [[UISceneConfiguration alloc] initWithName:@"Unleashed" sessionRole:session.role];
++    configuration.delegateClass = NSClassFromString(@"SDLUIKitSceneDelegate");
++    return configuration;
++}
++
++- (void)startMainForScene:(UIWindowScene *)scene
++{
++    self.windowScene = scene;
++    self.window.windowScene = scene;
++    if (!startedMain) {
++        startedMain = YES;
++        [self performSelector:@selector(postFinishLaunch) withObject:nil afterDelay:0.0];
++    }
++}
++#endif
++
+ - (UIWindow *)window
+ {
+     SDL_VideoDevice *_this = SDL_GetVideoDevice();
+@@ -527,6 +551,28 @@ - (BOOL)application:(UIApplication *)application openURL:(NSURL *)url sourceAppl
+ 
+ @end
+ 
++#ifdef SDL_UIKIT_USE_SCENES
++/* Unleashed Recompiled: wait for a connected scene before creating SDL windows. */
++@interface SDLUIKitSceneDelegate : NSObject<UIWindowSceneDelegate>
++@end
++
++@implementation SDLUIKitSceneDelegate
++- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)options
++{
++    if ([scene isKindOfClass:[UIWindowScene class]]) {
++        [[SDLUIKitDelegate sharedAppDelegate] startMainForScene:(UIWindowScene *)scene];
++    }
++}
++
++- (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)contexts
++{
++    for (UIOpenURLContext *context in contexts) {
++        [[SDLUIKitDelegate sharedAppDelegate] sendDropFileForURL:context.URL];
++    }
++}
++@end
++#endif
++
+ #endif /* SDL_VIDEO_DRIVER_UIKIT */
+ 
+ /* vi: set ts=4 sw=4 expandtab: */
+diff --git a/src/video/uikit/SDL_uikitevents.m b/src/video/uikit/SDL_uikitevents.m
+index 59e2eeef3..385284075 100644
+--- a/src/video/uikit/SDL_uikitevents.m
++++ b/src/video/uikit/SDL_uikitevents.m
+@@ -53,10 +53,18 @@ - (void)eventPumpChanged
+     NSNotificationCenter *notificationCenter = NSNotificationCenter.defaultCenter;
+     if (UIKit_EventPumpEnabled && !self.isObservingNotifications) {
+         self.isObservingNotifications = YES;
++#ifdef SDL_UIKIT_USE_SCENES
++        /* Unleashed Recompiled: lifecycle notifications now belong to the scene. */
++        [notificationCenter addObserver:self selector:@selector(applicationDidBecomeActive) name:UISceneDidActivateNotification object:nil];
++        [notificationCenter addObserver:self selector:@selector(applicationWillResignActive) name:UISceneWillDeactivateNotification object:nil];
++        [notificationCenter addObserver:self selector:@selector(applicationDidEnterBackground) name:UISceneDidEnterBackgroundNotification object:nil];
++        [notificationCenter addObserver:self selector:@selector(applicationWillEnterForeground) name:UISceneWillEnterForegroundNotification object:nil];
++#else
+         [notificationCenter addObserver:self selector:@selector(applicationDidBecomeActive) name:UIApplicationDidBecomeActiveNotification object:nil];
+         [notificationCenter addObserver:self selector:@selector(applicationWillResignActive) name:UIApplicationWillResignActiveNotification object:nil];
+         [notificationCenter addObserver:self selector:@selector(applicationDidEnterBackground) name:UIApplicationDidEnterBackgroundNotification object:nil];
+         [notificationCenter addObserver:self selector:@selector(applicationWillEnterForeground) name:UIApplicationWillEnterForegroundNotification object:nil];
++#endif
+         [notificationCenter addObserver:self selector:@selector(applicationWillTerminate) name:UIApplicationWillTerminateNotification object:nil];
+         [notificationCenter addObserver:self selector:@selector(applicationDidReceiveMemoryWarning) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
+ #if !TARGET_OS_TV
+diff --git a/src/video/uikit/SDL_uikitvideo.m b/src/video/uikit/SDL_uikitvideo.m
+index f23b5d31b..bde4c72df 100644
+--- a/src/video/uikit/SDL_uikitvideo.m
++++ b/src/video/uikit/SDL_uikitvideo.m
+@@ -209,6 +209,10 @@ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
+      * is used on an iPad. */
+     if (data != nil && data.uiwindow != nil) {
+         frame = data.uiwindow.bounds;
++#ifdef SDL_UIKIT_USE_SCENES
++        /* Scene windows already apply rotation; the legacy flip applies it twice. */
++        return frame;
++#endif
+     }
+ 
+ #if !TARGET_OS_TV
+diff --git a/src/video/uikit/SDL_uikitwindow.m b/src/video/uikit/SDL_uikitwindow.m
+index 41a6bbb9b..1e92381fb 100644
+--- a/src/video/uikit/SDL_uikitwindow.m
++++ b/src/video/uikit/SDL_uikitwindow.m
+@@ -90,7 +90,11 @@ static int SetupWindowData(_THIS, SDL_Window *window, UIWindow *uiwindow, SDL_bo
+     SDL_DisplayData *displaydata = (__bridge SDL_DisplayData *) display->driverdata;
+     SDL_uikitview *view;
+ 
++#ifdef SDL_UIKIT_USE_SCENES
++    CGRect frame = uiwindow.bounds;
++#else
+     CGRect frame = UIKit_ComputeViewFrame(window, displaydata.uiscreen);
++#endif
+     int width  = (int) frame.size.width;
+     int height = (int) frame.size.height;
+ 
+@@ -112,7 +116,7 @@ static int SetupWindowData(_THIS, SDL_Window *window, UIWindow *uiwindow, SDL_bo
+         window->flags |= SDL_WINDOW_BORDERLESS;  /* never has a status bar. */
+     }
+ 
+-#if !TARGET_OS_TV
++#if !TARGET_OS_TV && !defined(SDL_UIKIT_USE_SCENES)
+     if (displaydata.uiscreen == [UIScreen mainScreen]) {
+         NSUInteger orients = UIKit_GetSupportedOrientations(window);
+         BOOL supportsLandscape = (orients & UIInterfaceOrientationMaskLandscape) != 0;
+@@ -207,7 +211,16 @@ int UIKit_CreateWindow(_THIS, SDL_Window *window)
+ 
+         /* ignore the size user requested, and make a fullscreen window */
+         /* !!! FIXME: can we have a smaller view? */
++#ifdef SDL_UIKIT_USE_SCENES
++        /* Unleashed Recompiled: legacy unscened windows are invisible on iOS 27. */
++        UIWindowScene *scene = [[SDLUIKitDelegate sharedAppDelegate] windowScene];
++        if (!scene) {
++            return SDL_SetError("The application's window scene is not connected.");
++        }
++        uiwindow = [[SDL_uikitwindow alloc] initWithWindowScene:scene];
++#else
+         uiwindow = [[SDL_uikitwindow alloc] initWithFrame:data.uiscreen.bounds];
++#endif
+ 
+         /* put the window on an external display if appropriate. */
+         if (data.uiscreen != [UIScreen mainScreen]) {

@@ -324,6 +324,12 @@ if (WIN32)
         target_link_options(UnleashedRecomp PRIVATE "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
     endif()
 elseif (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(UNLEASHED_RECOMP_IOS_MINIMUM_VERSION "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    if (NOT UNLEASHED_RECOMP_IOS_MINIMUM_VERSION)
+        execute_process(COMMAND xcrun --sdk "${CMAKE_OSX_SYSROOT}" --show-sdk-version
+            OUTPUT_VARIABLE UNLEASHED_RECOMP_IOS_MINIMUM_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+    endif()
     CreateVersionString(
         VERSION_TXT ${VERSION_TXT}
         OUTPUT_VAR IOS_BUNDLE_VERSION
@@ -467,9 +473,13 @@ endif()
 
 set(UNLEASHED_RECOMP_PLATFORM_LIBS)
 if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    target_link_options(UnleashedRecomp PRIVATE
-        "LINKER:-ObjC"
-    )
+    target_link_options(UnleashedRecomp PRIVATE "LINKER:-ObjC")
+    if (UNLEASHED_RECOMP_IOS_NATIVE_METAL)
+        target_compile_definitions(UnleashedRecomp PRIVATE UNLEASHED_RECOMP_METAL=1)
+    else()
+        list(APPEND UNLEASHED_RECOMP_PLATFORM_LIBS MoltenVK)
+        target_link_options(UnleashedRecomp PRIVATE "LINKER:-u,_vkGetInstanceProcAddr")
+    endif()
 endif()
 
 target_link_libraries(UnleashedRecomp PRIVATE
